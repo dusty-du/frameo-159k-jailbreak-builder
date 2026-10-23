@@ -45,25 +45,41 @@ activity has its own vendor-key/restart side effect before this script starts.
 
 Recovery
 --------
+If the payload did not create ADB access, there is no remote recovery channel.
+Do not assume ADB, root, connect.sh, or a device-side helper is available.
+
+No ADB/root available (clean or partial failure)
+------------------------------------------------
 1. If the framework fails or the screen is black, REMOVE THE CARD FIRST. Keep
    physical access. If the device had a nonempty prior key set, keep its matching
    private key; a clean baseline has no prior key. Do not erase/reflash.
-2. Read result.txt and the attempt's recorded rollback status. A failed change
-   attempts to restore that attempt's exact original baseline and properties.
-3. Keep adb_keys.before.state and all per-attempt snapshots. adb_keys.before
-   contains key bytes only for a nonempty prior key set. Never treat an empty or
-   partial file as a valid nonempty backup. Do not overwrite newer active keys
-   blindly with an older recovery snapshot.
-4. If a nonempty prior key set existed, restore matching exact key bytes,
+2. Do NOT run ADB, connect.sh, a device-side key restore, or an adbd restart.
+   Those require a channel that this package has not yet created.
+3. Read result.txt, adb_keys.before.state and attempt.* on the card from the
+   host. Preserve the card and all attempt snapshots.
+4. Leave the failed card out. The payload removes its trigger; do not reinsert
+   the same package. Use only an available physical, vendor or bootrom recovery
+   path. If no such path exists, there is no remote recovery.
+5. If the frame still boots, use physical/UI access and a fresh, correctly
+   prepared card for any later attempt after diagnosing the failure. Do not
+   claim automatic rollback succeeded unless the attempt record proves it.
+
+ADB/root already available (normally after result.txt says done)
+---------------------------------------------------------------
+1. Use the private key matching adbkey and ./connect.sh <frame-ip> only when an
+   ADB channel already works. This helper is not a recovery channel for a clean
+   failed attempt.
+2. Read result.txt and the attempt's recorded rollback status.
+3. If a nonempty prior key set existed, restore matching exact key bytes,
    owner/mode/SELinux context and original properties. If the baseline was
    absent, remove the generated key file; if it was empty, restore the recorded
    empty file and metadata. An original property may be empty; keep that empty
    argument inside a device-side script.
-5. Restart adbd with one detached device-side helper and a status record. Never
+4. Restart adbd with one detached device-side helper and a status record. Never
    issue a bare stop or nested su/sh restart string: a lost adbd argument can
    stop the entire Android framework. Restore properties BEFORE restarting.
-6. Diagnose the failure before explicitly rearming. Keep snapshots, remove the
-   one-shot guard only for that deliberate retry, and publish the config LAST.
+5. Verify the restored state and do not claim success unless it matches the
+   recorded attempt baseline.
 
 The tested root syntax is su 0 <command>. ADB access is created by this payload;
 a clean run has no prior ADB channel. Run ./connect.sh <frame-ip> from the host
