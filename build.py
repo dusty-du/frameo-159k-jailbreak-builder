@@ -385,8 +385,9 @@ def make_manifest(out: Path, files: list[Path], payload_name: str,
             "The config is removed by the first execution of p_frameo_jb.",
             "started/done markers make the payload one-shot.",
             "Per-attempt snapshots preserve current key bytes, metadata, ports and adbd state for rollback.",
-            "adb_keys.before is retained clean recovery data; retries use fresh per-attempt snapshots.",
-            "done records local verification; remote ADB authentication is checked separately by connect.sh.",
+            "Clean absent/empty adb_keys baselines are supported; no prior ADB authorization is assumed.",
+            "adb_keys.before is present only for a nonempty prior key set; adb_keys.before.state records absent/empty/present.",
+            "done records local verification; remote ADB authentication is checked separately by connect.sh after success.",
         ],
     }
     write_text(out / "manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")

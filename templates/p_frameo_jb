@@ -17,6 +17,9 @@ main() {
   stage=
   mutated=0
   committed=0
+  baseline_state=
+  metadata=
+  label=
   date
   id
   [ "$(id -u)" = 0 ] || fail 'root is required'
@@ -28,17 +31,34 @@ main() {
   rm -f "$d/Frameo_utilities/frameo_utilities.config" || fail 'cannot disarm trigger'
   [ ! -e "$d/Frameo_utilities/frameo_utilities.config" ] || fail 'trigger still exists'
   validate_keys "$d/adbkey" supplied || fail 'invalid supplied public key'
-  [ -f "$keys" ] && [ ! -L "$keys" ] || fail 'active key file is missing or a symlink'
-  metadata=$(stat -c '%u %g %a' "$keys") || fail 'cannot read key metadata'
-  label=$(get_label "$keys") || fail 'cannot read key SELinux label'
+  [ -L "$keys" ] && fail 'active key path is a symlink'
+  if [ ! -e "$keys" ]; then
+    # A clean device may have no adb_keys file at all. Do not require prior
+    # authorization; create the file with the platform defaults.
+    baseline_state=absent
+    metadata='1000 2000 640'
+    label='u:object_r:adb_keys_file:s0'
+    : > "$attempt/adb_keys.raw" || fail 'cannot record absent key baseline'
+    : > "$attempt/adb_keys.clean" || fail 'cannot record clean baseline'
+  else
+    [ -f "$keys" ] || fail 'active key path is not a regular file'
+    metadata=$(stat -c '%u %g %a' "$keys") || fail 'cannot read key metadata'
+    label=$(get_label "$keys") || fail 'cannot read key SELinux label'
+    cp "$keys" "$attempt/adb_keys.raw" || fail 'cannot snapshot active keys'
+    cmp -s "$keys" "$attempt/adb_keys.raw" || fail 'active keys changed during snapshot'
+    check_metadata "$keys" || fail 'key metadata changed during snapshot'
+    # Only the known malformed vendor prefix is removed. Keep all other lines.
+    clean_current "$attempt/adb_keys.raw" > "$attempt/adb_keys.clean" || fail 'cannot clean current snapshot'
+    if [ -s "$attempt/adb_keys.raw" ]; then
+      baseline_state=present
+      validate_keys "$attempt/adb_keys.clean" current || fail 'invalid current key snapshot'
+    else
+      baseline_state=empty
+    fi
+  fi
+  printf '%s\n' "$baseline_state" > "$attempt/baseline.state" || fail 'cannot save baseline state'
   printf '%s\n' "$metadata" > "$attempt/metadata" || fail 'cannot save metadata'
   printf '%s\n' "$label" > "$attempt/selinux" || fail 'cannot save SELinux label'
-  cp "$keys" "$attempt/adb_keys.raw" || fail 'cannot snapshot active keys'
-  cmp -s "$keys" "$attempt/adb_keys.raw" || fail 'active keys changed during snapshot'
-  check_metadata "$keys" || fail 'key metadata changed during snapshot'
-  # Only the known malformed vendor prefix is removed. Keep all other lines.
-  clean_current "$attempt/adb_keys.raw" > "$attempt/adb_keys.clean" || fail 'cannot clean current snapshot'
-  validate_keys "$attempt/adb_keys.clean" current || fail 'invalid current key snapshot'
   service_port=$(getprop service.adb.tcp.port) || fail 'cannot read service port'
   persist_port=$(getprop persist.adb.tcp.port) || fail 'cannot read persistent port'
   adbd_state=$(getprop init.svc.adbd) || fail 'cannot read adbd state'
@@ -48,17 +68,51 @@ main() {
   printf '%s\n' "$adbd_state" > "$attempt/init.svc.adbd" || fail 'cannot save adbd state'
   touch "$attempt/snapshot.complete" || fail 'cannot complete snapshot'
 
-  # Validate legacy backups. Never overwrite them or use them for a retry.
-  if [ -e "$d/adb_keys.before" ]; then
+  # Preserve the original recovery state. A clean absent/empty baseline has no
+  # key backup; a sidecar records that explicitly instead of inventing keys.
+  backup_state_file="$d/adb_keys.before.state"
+  if [ -e "$backup_state_file" ]; then
+    [ -f "$backup_state_file" ] && [ ! -L "$backup_state_file" ] || fail 'invalid recovery state file'
+    backup_state=$(cat "$backup_state_file") || fail 'cannot read recovery state'
+    case "$backup_state" in absent|empty|present) ;; *) fail 'invalid recovery state';;
+    esac
+  elif [ -e "$d/adb_keys.before" ]; then
     if [ ! -f "$d/adb_keys.before" ] || [ -L "$d/adb_keys.before" ]; then
       fail 'invalid existing recovery backup'
     fi
-    validate_keys "$d/adb_keys.before" recovery || fail 'invalid existing recovery backup'
+    [ -s "$d/adb_keys.before" ] || fail 'invalid existing recovery backup: legacy empty state missing'
+    backup_state=present
+    printf '%s\n' "$backup_state" > "$backup_state_file" || fail 'cannot save recovery state'
   else
-    cp "$attempt/adb_keys.clean" "$attempt/adb_keys.recovery.pending" || fail 'cannot stage recovery backup'
-    cmp -s "$attempt/adb_keys.clean" "$attempt/adb_keys.recovery.pending" || fail 'recovery backup is incomplete'
-    mv "$attempt/adb_keys.recovery.pending" "$d/adb_keys.before" || fail 'cannot publish recovery backup'
+    backup_state=$baseline_state
+    case "$backup_state" in
+      present)
+        cp "$attempt/adb_keys.clean" "$attempt/adb_keys.recovery.pending" || fail 'cannot stage recovery backup'
+        cmp -s "$attempt/adb_keys.clean" "$attempt/adb_keys.recovery.pending" || fail 'recovery backup is incomplete'
+        mv "$attempt/adb_keys.recovery.pending" "$d/adb_keys.before" || fail 'cannot publish recovery backup'
+        ;;
+      empty)
+        : > "$attempt/adb_keys.recovery.pending" || fail 'cannot stage empty recovery backup'
+        mv "$attempt/adb_keys.recovery.pending" "$d/adb_keys.before" || fail 'cannot publish empty recovery backup'
+        ;;
+      absent) ;;
+      *) fail 'invalid clean baseline state';;
+    esac
+    printf '%s\n' "$backup_state" > "$backup_state_file" || fail 'cannot save recovery state'
   fi
+  case "$backup_state" in
+    absent)
+      [ ! -e "$d/adb_keys.before" ] || fail 'recovery state absent but key backup exists'
+      ;;
+    empty)
+      [ -f "$d/adb_keys.before" ] && [ ! -L "$d/adb_keys.before" ] && [ ! -s "$d/adb_keys.before" ] \
+        || fail 'invalid empty recovery backup'
+      ;;
+    present)
+      [ -f "$d/adb_keys.before" ] && [ ! -L "$d/adb_keys.before" ] || fail 'invalid recovery backup'
+      validate_keys "$d/adb_keys.before" recovery || fail 'invalid existing recovery backup'
+      ;;
+  esac
   # Cleaning supplies line boundaries; deduplicate only the exact key blob.
   merge_current || fail 'cannot merge keys'
   validate_keys "$attempt/adb_keys.merged" merged || fail 'invalid merged key file'
@@ -66,8 +120,20 @@ main() {
   prepare_stage "$attempt/adb_keys.merged" || fail 'cannot prepare staged keys'
   sync || fail 'cannot persist recovery snapshots'
   # Detect concurrent edits immediately before replacement.
-  cmp -s "$keys" "$attempt/adb_keys.raw" || fail 'active keys changed before replacement'
-  check_metadata "$keys" || fail 'key metadata changed before replacement'
+  case "$baseline_state" in
+    absent)
+      [ ! -e "$keys" ] || fail 'active key path appeared before replacement'
+      ;;
+    empty)
+      [ -f "$keys" ] && [ ! -s "$keys" ] && check_metadata "$keys" \
+        || fail 'empty key baseline changed before replacement'
+      ;;
+    present)
+      cmp -s "$keys" "$attempt/adb_keys.raw" || fail 'active keys changed before replacement'
+      check_metadata "$keys" || fail 'key metadata changed before replacement'
+      ;;
+    *) fail 'invalid key baseline state';;
+  esac
   # An ambiguous/interrupted rename also requires rollback.
   mutated=1
   mv -f "$stage" "$keys" || fail 'key replacement failed'
@@ -204,21 +270,36 @@ rollback() {
   echo 'ROLLBACK: restoring this attempt snapshot'
   rollback_failed=0
   [ -z "$stage" ] || rm -f "$stage" || rollback_failed=1
-  stage=$(mktemp "$keys.frameo.rollback.XXXXXX") || stage=
-  if [ -n "$stage" ]; then
-    cp "$attempt/adb_keys.raw" "$stage" || rollback_failed=1
-    # Split whitespace-delimited fields; set -f disables pathname expansion.
-    # shellcheck disable=SC2086
-    set -- $metadata
-    chown "$1:$2" "$stage" && chmod "$3" "$stage" && chcon "$label" "$stage" || rollback_failed=1
-    if cmp -s "$stage" "$attempt/adb_keys.raw" && check_metadata "$stage"; then
-      mv -f "$stage" "$keys" || rollback_failed=1
-    else
-      rollback_failed=1
-    fi
-  else
-    rollback_failed=1
-  fi
+  stage=
+  case "$baseline_state" in
+    absent)
+      # The clean baseline had no key file; remove the generated file.
+      rm -f "$keys" || rollback_failed=1
+      [ ! -e "$keys" ] || rollback_failed=1
+      ;;
+    empty|present)
+      stage=$(mktemp "$keys.frameo.rollback.XXXXXX") || stage=
+      if [ -n "$stage" ]; then
+        cp "$attempt/adb_keys.raw" "$stage" || rollback_failed=1
+        # Split whitespace-delimited fields; set -f disables pathname expansion.
+        # shellcheck disable=SC2086
+        set -- $metadata
+        chown "$1:$2" "$stage" && chmod "$3" "$stage" && chcon "$label" "$stage" || rollback_failed=1
+        if cmp -s "$stage" "$attempt/adb_keys.raw" && check_metadata "$stage"; then
+          if mv -f "$stage" "$keys"; then
+            stage=
+          else
+            rollback_failed=1
+          fi
+        else
+          rollback_failed=1
+        fi
+      else
+        rollback_failed=1
+      fi
+      ;;
+    *) rollback_failed=1;;
+  esac
   setprop service.adb.tcp.port "$service_port" || rollback_failed=1
   setprop persist.adb.tcp.port "$persist_port" || rollback_failed=1
   stop adbd || rollback_failed=1
@@ -227,7 +308,15 @@ rollback() {
     start adbd || rollback_failed=1
     wait_state running || rollback_failed=1
   fi
-  cmp -s "$keys" "$attempt/adb_keys.raw" && check_metadata "$keys" || rollback_failed=1
+  case "$baseline_state" in
+    absent)
+      [ ! -e "$keys" ] || rollback_failed=1
+      ;;
+    empty|present)
+      cmp -s "$keys" "$attempt/adb_keys.raw" && check_metadata "$keys" || rollback_failed=1
+      ;;
+    *) rollback_failed=1;;
+  esac
   verify_property service.adb.tcp.port "$service_port" || rollback_failed=1
   verify_property persist.adb.tcp.port "$persist_port" || rollback_failed=1
   verify_property init.svc.adbd "$adbd_state" || rollback_failed=1
