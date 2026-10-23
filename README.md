@@ -49,7 +49,7 @@ The `#` comments out the trailing `.apk'`. The APK install command is never rele
 
 No literal `/` is needed in the filename, which keeps it valid on FAT/exFAT.
 
-### Final-path variant
+### Final payload filename
 
 The tested package used a removable-card locator instead of the primary `/sdcard`:
 
