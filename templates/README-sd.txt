@@ -14,9 +14,7 @@ metadata APK does not replace the installed Frameo app.
 
 A clean device may have no /data/misc/adb/adb_keys file or an empty one. The
 payload accepts either as an empty baseline, creates the file with the supplied
-public key, and preserves nonempty existing keys. Factory-stock applicability of
-the root-execution path and cold-boot TCP ADB persistence are not established by
-the historical lab evidence.
+public key, and preserves nonempty existing keys.
 
 The repaired tooling has host-only validation. It has not been deployed to a
 frame. Factory-stock applicability and cold-boot TCP ADB persistence are not
