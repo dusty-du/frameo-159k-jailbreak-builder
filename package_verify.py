@@ -22,7 +22,7 @@ PAYLOAD_NAME = "x';sh${IFS}$(find${IFS}${ANDROID_DATA%data}storage${IFS}-maxdept
 CONFIG_BODY = b"auto_run=action_update_version\n"
 OUTPUTS = {"sd_zip": "frameo-jailbreak-sd.zip", "sd_dir": "sd", "connect_script": "connect.sh"}
 SD_FILES = {"Frameo_utilities/frameo_utilities.config", "Frameo_utilities/" + PAYLOAD_NAME,
-            "p_frameo_jb", "adbkey", "README.txt"}
+            "p_frameo_jb", "adbkey"}
 MANIFEST_FILES = {"sd/" + name for name in SD_FILES} | {"connect.sh", "frameo-jailbreak-sd.zip"}
 
 
@@ -205,8 +205,17 @@ def verify_package(out: Path | str, *, build_tools: Path | str | None = None,
                     fail(f"ZIP bytes differ from SD/manifest: {entry.filename}")
     except (BadZipFile, RuntimeError, NotImplementedError) as exc:
         fail(f"invalid ZIP: {exc}")
-    tool = aapt2 or find_aapt2(build_tools, sdk)
     payload_path = sd / "Frameo_utilities" / PAYLOAD_NAME
+    verify_payload_apk(payload_path, manifest, build_tools=build_tools, sdk=sdk, aapt2=aapt2)
+    return manifest
+
+
+def verify_payload_apk(payload_path: Path | str, manifest: dict, *,
+                       build_tools: Path | str | None = None,
+                       sdk: Path | str | None = None,
+                       aapt2: Path | None = None) -> None:
+    payload_path = Path(payload_path)
+    tool = aapt2 or find_aapt2(build_tools, sdk)
     try:
         proc = subprocess.run([str(tool), "dump", "badging", str(payload_path)],
                               check=True, text=True, capture_output=True)
@@ -224,7 +233,66 @@ def verify_package(out: Path | str, *, build_tools: Path | str | None = None,
                        check=True, text=True, capture_output=True)
     except (OSError, subprocess.CalledProcessError) as exc:
         fail(f"APK signature verification failed: {exc}")
-    return manifest
+
+
+def verify_sd_card(card: Path | str, source_sd: Path | str, manifest: dict, *,
+                   build_tools: Path | str | None = None,
+                   sdk: Path | str | None = None,
+                   aapt2: Path | None = None) -> None:
+    """Verify the actual mounted-card files after an SD write."""
+    card = assert_no_symlink_components(Path(card))
+    if not card.is_dir():
+        fail(f"card path is not a directory: {card}")
+    source_sd = Path(source_sd)
+    if not source_sd.is_dir():
+        fail(f"source SD directory is missing: {source_sd}")
+    validate_manifest(manifest)
+    frameo = card / "Frameo_utilities"
+    if not frameo.is_dir() or frameo.is_symlink():
+        fail("card is missing Frameo_utilities")
+    actual = set()
+    for path in frameo.rglob("*"):
+        rel = path.relative_to(frameo).as_posix()
+        if path.is_symlink() or path.is_dir():
+            fail(f"unexpected directory/symlink on card: {rel}")
+        actual.add(rel)
+    expected_frameo = {"frameo_utilities.config", PAYLOAD_NAME}
+    if actual != expected_frameo:
+        fail(f"card Frameo_utilities inventory differs: {sorted(actual)}")
+    for rel in ("p_frameo_jb", "adbkey"):
+        path = card / rel
+        if path.is_symlink() or not path.is_file():
+            fail(f"card missing regular file: {rel}")
+    for forbidden in ("README.txt", "started", "done", "result.txt",
+                      "adb_keys.before", "adb_keys.before.state",
+                      "connect.sh", "frameo-jailbreak-sd.zip", "manifest.json"):
+        if (card / forbidden).exists():
+            fail(f"unexpected package artifact on card: {forbidden}")
+    if list(card.glob("attempt.*")):
+        fail("unexpected attempt directory on card")
+    for name in frameo.rglob("._*"):
+        fail(f"AppleDouble file on card: {name.name}")
+    for rel in SD_FILES:
+        card_path, source_path = card / rel, source_sd / rel
+        if card_path.is_symlink() or not card_path.is_file():
+            fail(f"card file missing or symlinked: {rel}")
+        data = card_path.read_bytes()
+        if data != source_path.read_bytes():
+            fail(f"card bytes differ from source: {rel}")
+        info = manifest["files"].get("sd/" + rel)
+        if not info or len(data) != info["bytes"] or hashlib.sha256(data).hexdigest() != info["sha256"]:
+            fail(f"card file differs from manifest: {rel}")
+    if (card / "Frameo_utilities/frameo_utilities.config").read_bytes() != CONFIG_BODY:
+        fail("unexpected config body on card")
+    try:
+        key = (card / "adbkey").read_text(encoding="utf-8")
+    except UnicodeError:
+        fail("adbkey on card is not UTF-8")
+    if not re.fullmatch(r"[^\s]+ frameo-jailbreak\n", key):
+        fail("adbkey on card must be one public key with the frameo-jailbreak comment")
+    validate_adb_blob(key.split()[0])
+    verify_payload_apk(card / "Frameo_utilities" / PAYLOAD_NAME, manifest,
+                       build_tools=build_tools, sdk=sdk, aapt2=aapt2)
 
 
 def main(argv: list[str] | None = None) -> int:

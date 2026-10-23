@@ -24,7 +24,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from package_verify import (VerificationError, assert_no_symlink_components,
                             read_json, validate_adb_blob, validate_manifest,
-                            verify_package)
+                            verify_package, verify_sd_card)
 
 ROOT = Path(__file__).resolve().parent
 TEMPLATES = ROOT / "templates"
@@ -224,6 +224,73 @@ def promote_output(stage: Path, out: Path) -> Path | None:
     return backup
 
 
+def validate_card_path(card: Path, inputs: list[Path], out: Path | None = None) -> Path:
+    """Validate a mounted SD directory without deleting or clearing it."""
+    try:
+        card = assert_no_symlink_components(card)
+    except VerificationError as exc:
+        die(str(exc))
+    card = card.resolve()
+    if not card.is_dir():
+        die(f"SD card path is not a directory: {card}")
+    if card == ROOT or card in ROOT.parents:
+        die(f"SD card path must not be the source directory or its ancestor: {card}")
+    for protected in (TEMPLATES, ROOT / ".git", ROOT / ".agents", ROOT / ".codex"):
+        protected = protected.resolve()
+        if card == protected or protected in card.parents:
+            die(f"SD card path is inside a source/configuration input: {protected}")
+    for path in inputs:
+        path = path.expanduser().resolve()
+        if path == card or card in path.parents:
+            die(f"SD card path contains a build input: {path}")
+        if path.is_dir() and path in card.parents:
+            die(f"SD card path is inside a build input: {path}")
+    if out is not None:
+        out = out.resolve()
+        if card == out or card in out.parents or out in card.parents:
+            die(f"SD card path overlaps the build output: {card}")
+    collisions = sorted(name for name in (
+        "Frameo_utilities", "p_frameo_jb", "adbkey", "README.txt",
+        "started", "done", "result.txt", "adb_keys.before",
+        "adb_keys.before.state", "connect.sh", "frameo-jailbreak-sd.zip",
+        "manifest.json",
+    ) if (card / name).exists())
+    attempts = sorted(path.name for path in card.glob("attempt.*"))
+    if collisions or attempts:
+        detail = ", ".join(collisions + attempts)
+        die(f"SD card package namespace is not clean: {detail}")
+    return card
+
+
+def write_sd_card(card: Path, sd: Path, manifest: dict, build_tools: Path) -> None:
+    """Write a verified SD directory to a clean mounted card."""
+    created: list[Path] = []
+    try:
+        frameo = card / "Frameo_utilities"
+        frameo.mkdir()
+        created.append(frameo)
+        for rel in ("Frameo_utilities/" + PAYLOAD_NAME, SCRIPT_NAME, "adbkey"):
+            destination = card / rel
+            shutil.copyfile(sd / rel, destination)
+            created.append(destination)
+        # Publish the trigger last.
+        config = card / "Frameo_utilities" / CONFIG_NAME
+        shutil.copyfile(sd / "Frameo_utilities" / CONFIG_NAME, config)
+        created.append(config)
+        verify_sd_card(card, sd, manifest, build_tools=build_tools)
+    except BaseException:
+        # Remove the trigger first, then only paths created by this invocation.
+        for path in reversed(created):
+            try:
+                if path.is_file() or path.is_symlink():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            except OSError:
+                pass
+        raise
+
+
 def ensure_keystore(out: Path, keystore: Path | None, ks_pass: str, key_pass: str) -> Path:
     if keystore:
         if not keystore.is_file():
@@ -397,8 +464,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build a Frameo jailbreak SD package")
     parser.add_argument("--adb-pubkey", required=True, type=Path,
                         help="Android ADB public key, usually ~/.android/adbkey.pub")
-    parser.add_argument("--out", type=Path, default=ROOT / "out",
-                        help="output directory (default: ./out)")
+    parser.add_argument("--out", type=Path, default=None,
+                        help="persistent output directory (default: ./out; optional with --sd-card)")
+    parser.add_argument("--sd-card", type=Path, default=None,
+                        help="write and verify the SD package directly on a clean mounted card")
     parser.add_argument("--android-sdk", type=Path, default=None)
     parser.add_argument("--build-tools", default=None)
     parser.add_argument("--version-code", type=int, default=PAYLOAD_VERSION_CODE)
@@ -420,7 +489,7 @@ def main() -> int:
     build_tools = find_build_tools(sdk, args.build_tools).resolve()
     platform = find_platform(sdk).resolve()
     selected_keystore = resolve_keystore(args.keystore)
-    template_names = ("AndroidManifest.xml", SCRIPT_NAME, "README-sd.txt", "connect.sh")
+    template_names = ("AndroidManifest.xml", SCRIPT_NAME, "connect.sh")
     # Read every template now, before creating directories or moving previous output.
     template_data = {}
     for name in template_names:
@@ -433,27 +502,55 @@ def main() -> int:
               Path(__file__), ROOT / "package_verify.py", ROOT / "verify.sh"]
     if selected_keystore is not None:
         inputs.append(selected_keystore)
-    out = validate_destination(args.out, inputs, force=args.force)
+
+    requested_out = args.out if args.out is not None else None
+    card = None
+    if args.sd_card is not None:
+        card = validate_card_path(args.sd_card, inputs, requested_out)
+
+    temp_root = None
+    if requested_out is None:
+        if card is not None:
+            temp_root = Path(tempfile.mkdtemp(prefix=".frameo-sd-build-", dir=ROOT))
+            out = temp_root / "out"
+        else:
+            out = ROOT / "out"
+    else:
+        out = requested_out
+    out = validate_destination(out, inputs, force=args.force)
     out.parent.mkdir(parents=True, exist_ok=True)
     # A sibling keeps renames on one filesystem. Failed builds never touch out.
-    stage = Path(tempfile.mkdtemp(prefix=f".{out.name}.staging-", dir=out.parent))
+    stage = None
+    backup = None
     try:
+        stage = Path(tempfile.mkdtemp(prefix=f".{out.name}.staging-", dir=out.parent))
         build_package(stage, build_tools, platform, selected_keystore,
                       args.ks_pass, args.key_pass, args.version_code, pub_line, template_data)
         verify_package(stage, build_tools=build_tools)
         # Recheck after slow build tools, including ownership and symlink ancestors.
         validate_destination(out, inputs, force=args.force)
         backup = promote_output(stage, out)
+        if card is not None:
+            # Recheck the card after the slower build, then write and verify it.
+            card = validate_card_path(card, inputs, out)
+            manifest = read_json(out / "manifest.json")
+            write_sd_card(card, out / "sd", manifest, build_tools)
     finally:
-        if stage.exists():
+        if stage is not None and stage.exists():
             shutil.rmtree(stage)
+        if temp_root is not None:
+            shutil.rmtree(temp_root, ignore_errors=True)
     if backup is not None:
         print(f"previous output retained: {backup}")
-    print(f"built and verified: {out}")
-    print(f"  SD directory: {out / 'sd'}")
-    print(f"  SD zip:       {out / 'frameo-jailbreak-sd.zip'}")
-    print("next: copy the CONTENTS of sd/ to the root of a FAT/exFAT SD card.")
-    print("      do not force-stop Frameo; insert the card or reboot with it inserted.")
+    if card is not None:
+        print(f"SD card written and verified: {card}")
+    if requested_out is not None:
+        print(f"built and verified: {out}")
+        print(f"  SD directory: {out / 'sd'}")
+        print(f"  SD zip:       {out / 'frameo-jailbreak-sd.zip'}")
+        print("next: do not force-stop Frameo; insert the card or reboot with it inserted.")
+    else:
+        print("temporary build removed; the verified package is on the SD card.")
     return 0
 
 
@@ -474,17 +571,6 @@ def build_package(out: Path, build_tools: Path, platform: Path,
     shutil.copyfile(apk, payload_path)
     write_text(sd / SCRIPT_NAME, templates[SCRIPT_NAME], 0o755)
     write_text(sd / "adbkey", pub_line, 0o644)
-
-    readme = templates["README-sd.txt"]
-    readme = (
-        readme.replace("{{BUILD_DATE}}", datetime.now(timezone.utc).isoformat(timespec="seconds"))
-        .replace("{{PACKAGE}}", PACKAGE)
-        .replace("{{VERSION_NAME}}", FRAMEO_VERSION)
-        .replace("{{PAYLOAD_VERSION_CODE}}", str(version_code))
-        .replace("{{PAYLOAD_NAME}}", PAYLOAD_NAME)
-        .replace("{{ADB_KEY_COMMENT}}", ADB_KEY_COMMENT)
-    )
-    write_text(sd / "README.txt", readme, 0o644)
 
     write_text(out / "connect.sh", templates["connect.sh"], 0o755)
 
