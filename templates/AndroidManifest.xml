@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="net.frameo.frame"
+    android:versionCode="69881"
+    android:versionName="1.30.20">
+    <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="34" />
+    <application android:label="Frameo Jailbreak" />
+</manifest>
